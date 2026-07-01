@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/tracklogic/tracklogic-haptic/pkg/hpr"
+	"github.com/tracklogic/tracklogic-peripherals/pkg/hpr"
 )
 
 type mockTransport struct {

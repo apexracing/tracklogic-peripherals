@@ -1,6 +1,6 @@
 // Package hidtransport is the Windows implementation of the
 // scanner and transport the hpr package consumes. It is internal:
-// the public surface of tracklogic-haptic is hpr.Driver / hpr.Device
+// the public surface of tracklogic-peripherals is hpr.Driver / hpr.Device
 // / hpr.Transport.
 //
 // To avoid an import cycle (hpr imports this package, so this

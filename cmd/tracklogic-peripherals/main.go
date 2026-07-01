@@ -1,12 +1,12 @@
-// Command tracklogic-haptic is a thin CLI over the tracklogic-haptic
-// library. It scans for supported haptic pedal devices, lets the
-// user pick one (or a vendor model), and emits a single vibration
-// command before exiting.
+// Command tracklogic-peripherals is a thin CLI over the
+// tracklogic-peripherals library. It scans for supported haptic
+// pedal devices, lets the user pick one (or a vendor model), and
+// emits a single vibration command before exiting.
 //
 // Example:
 //
-//	tracklogic-haptic -ch 1 -f 30 -a 80 -d 2s
-//	tracklogic-haptic -list
+//	tracklogic-peripherals -ch 1 -f 30 -a 80 -d 2s
+//	tracklogic-peripherals -list
 package main
 
 import (
@@ -18,8 +18,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tracklogic/tracklogic-haptic/pkg/hpr/driver/simagic"
-	"github.com/tracklogic/tracklogic-haptic/pkg/hpr"
+	"github.com/tracklogic/tracklogic-peripherals/pkg/hpr/driver/simagic"
+	"github.com/tracklogic/tracklogic-peripherals/pkg/hpr"
 )
 
 func main() {

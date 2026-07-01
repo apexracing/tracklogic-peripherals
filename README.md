@@ -1,21 +1,21 @@
-# tracklogic-haptic
+# tracklogic-peripherals
 
-面向多厂家的 Go 触觉反馈脚踏板库。
+面向赛车模拟器外设的 Go 驱动库。
 
-本库以 `hpr` 包暴露一组稳定接口（`Driver`、`Device`、`Transport`、`DeviceScanner`、`TransportOpener`），并通过 `Manager` 将它们组合起来。具体的厂家驱动作为子包放在 `driver/<vendor>/` 下，核心包对厂家完全无感。
+本库以 `pkg/hpr` 包暴露一组稳定接口（`Driver`、`Device`、`Transport`、`DeviceScanner`、`TransportOpener`），并通过 `Manager` 将它们组合起来。具体的厂家驱动作为 `pkg/hpr/driver/<vendor>/` 下的子包存在，核心包对外设类型完全无感——后续会扩展到 wheelbase 力反馈、shifter、handbrake 等。
 
 ## 状态
 
 **v1.0.0** — 仅支持 Windows。当前已支持的设备：
 
-| 厂家       | 包                       | 型号                                       |
-| ---------- | ------------------------ | ------------------------------------------ |
-| Simagic    | `driver/simagic`         | P500、P700、P1000、P2000、Alpha Pedal Neo  |
+| 厂家       | 包                                            | 型号                                       |
+| ---------- | --------------------------------------------- | ------------------------------------------ |
+| Simagic    | `pkg/hpr/driver/simagic`                      | P500、P700、P1000、P2000、Alpha Pedal Neo  |
 
 ## 安装
 
 ```sh
-go get github.com/tracklogic/tracklogic-haptic
+go get github.com/tracklogic/tracklogic-peripherals
 ```
 
 ## 快速上手
@@ -27,8 +27,8 @@ import (
     "log"
     "time"
 
-    "github.com/tracklogic/tracklogic-haptic/pkg/hpr/driver/simagic"
-    "github.com/tracklogic/tracklogic-haptic/pkg/hpr"
+    "github.com/tracklogic/tracklogic-peripherals/pkg/hpr"
+    "github.com/tracklogic/tracklogic-peripherals/pkg/hpr/driver/simagic"
 )
 
 func main() {
@@ -61,11 +61,11 @@ func main() {
 
 ## 命令行工具
 
-仓库自带一个简单 CLI，路径在 `cmd/tracklogic-haptic`：
+仓库自带一个简单 CLI，路径在 `cmd/tracklogic-peripherals`：
 
 ```sh
-go run ./cmd/tracklogic-haptic -list
-go run ./cmd/tracklogic-haptic -ch 1 -f 30 -a 80 -d 2s
+go run ./cmd/tracklogic-peripherals -list
+go run ./cmd/tracklogic-peripherals -ch 1 -f 30 -a 80 -d 2s
 ```
 
 ## 架构
@@ -77,6 +77,8 @@ go run ./cmd/tracklogic-haptic -ch 1 -f 30 -a 80 -d 2s
 │  + TransportOpener │                │   simagic          │
 │                    │                │  pkg/hpr/driver/   │
 │                    │                │   fanatec (未来)   │
+│                    │                │  pkg/hpr/driver/   │
+│                    │                │   wheelbase (未来) │
 └────────┬───────────┘                └─────────┬──────────┘
          │                                      │
          │  Scan() → DeviceInfo                │  Open(info, transport)
@@ -96,7 +98,7 @@ go run ./cmd/tracklogic-haptic -ch 1 -f 30 -a 80 -d 2s
 
 ### 设计原则
 
-1. **`hpr` 包对厂家完全无感**。它不能 import `driver/` 下的任何子包。新增厂家不需要改动 `hpr`。
+1. **`hpr` 包对外设完全无感**。它不能 import `pkg/hpr/driver/` 下的任何子包。新增外设类型或厂家不需要改动 `hpr`。
 2. **驱动是无状态工厂**。所有设备状态都保存在 `Driver.Open` 返回的 `Device` 上。
 3. **能力由驱动声明**。`Device.Capabilities()` 是"设备支持什么"的唯一来源；调用方不应写死任何厂家的数值。
 4. **厂家私有数据在厂家包里保持强类型**。`DeviceInfo.Model` 的类型是 `any`；需要解释时请用类型断言或类型 switch 拿到厂家包里的具体类型（如 `simagic.Model`）。
@@ -107,7 +109,7 @@ go run ./cmd/tracklogic-haptic -ch 1 -f 30 -a 80 -d 2s
 ```go
 package myvendor
 
-import "github.com/tracklogic/tracklogic-haptic/pkg/hpr"
+import "github.com/tracklogic/tracklogic-peripherals/pkg/hpr"
 
 type Driver struct{}
 
@@ -147,13 +149,13 @@ mgr := hpr.NewManager(hpr.WithDrivers(
 ```
 .
 ├── pkg/
-│   └── hpr/              # 与厂家无关的公共 API
+│   └── hpr/                  # 与厂家无关的公共 API
 │       └── driver/
-│           └── simagic/  # Simagic 驱动
+│           └── simagic/      # Simagic 驱动
 ├── internal/
-│   └── hidtransport/     # Windows HID 传输层（internal）
+│   └── hidtransport/         # Windows HID 传输层（internal）
 └── cmd/
-    └── tracklogic-haptic # 命令行工具
+    └── tracklogic-peripherals # 命令行工具
 ```
 
 ## 许可证

@@ -1,5 +1,5 @@
 // Package hpr contains the vendor-neutral types and interfaces used by
-// tracklogic-haptic. See doc.go for an overview.
+// tracklogic-peripherals. See doc.go for an overview.
 package hpr
 
 import "fmt"

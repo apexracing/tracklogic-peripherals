@@ -3,7 +3,7 @@
 package hpr
 
 import (
-	"github.com/tracklogic/tracklogic-haptic/internal/hidtransport"
+	"github.com/tracklogic/tracklogic-peripherals/internal/hidtransport"
 )
 
 // hidScanner adapts hidtransport.Scanner to hpr.DeviceScanner.

@@ -1,4 +1,4 @@
-module github.com/tracklogic/tracklogic-haptic
+module github.com/tracklogic/tracklogic-peripherals
 
 go 1.26.4
 

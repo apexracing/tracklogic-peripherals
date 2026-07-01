@@ -1,4 +1,4 @@
-// Package hpr defines the vendor-neutral public API for tracklogic-haptic.
+// Package hpr defines the vendor-neutral public API for tracklogic-peripherals.
 //
 // The package exposes a small set of interfaces (Driver, Device, Transport,
 // DeviceScanner, TransportOpener) plus a Manager that composes them at runtime.
