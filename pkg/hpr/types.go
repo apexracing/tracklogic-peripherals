@@ -94,7 +94,7 @@ type DeviceInfo struct {
 
 	VendorID      uint16
 	ProductID     uint16
-	VersionNumber uint32
+	VersionNumber uint16
 
 	UsagePage uint16
 	Usage     uint16
