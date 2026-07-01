@@ -34,7 +34,7 @@ func defaultTransportOpener() TransportOpener { return hidOpener }
 
 // deviceDescriptorToInfo lifts a platform descriptor to the
 // universal hpr.DeviceInfo. DriverName and Model are filled in
-// later by Manager.decorate.
+// later by Manager.Scan via the claiming driver's Describe.
 func deviceDescriptorToInfo(d hidtransport.DeviceDescriptor) DeviceInfo {
 	return DeviceInfo{
 		DevicePath:    d.DevicePath,

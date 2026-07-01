@@ -62,8 +62,9 @@ func WithTransportOpener(opener TransportOpener) Option {
 
 // Scan enumerates the system for devices claimed by any registered
 // driver. The returned slice is filtered: devices no driver matches
-// are dropped. Each entry's DriverName and Model fields are set
-// by the claiming driver.
+// are dropped. Each entry is enriched by the claiming driver's
+// Describe (which sets vendor-specific fields such as Model) and
+// stamped with that driver's Name.
 func (m *Manager) Scan() ([]DeviceInfo, error) {
 	if m.scanner == nil {
 		return nil, ErrNoDevices
@@ -74,27 +75,43 @@ func (m *Manager) Scan() ([]DeviceInfo, error) {
 	}
 
 	out := make([]DeviceInfo, 0, len(raw))
+claim:
 	for _, info := range raw {
-		driver := m.firstMatchingDriver(info)
-		if driver == nil {
-			continue
+		for _, d := range m.drivers {
+			if !d.Match(info) {
+				continue
+			}
+			info = d.Describe(info)
+			info.DriverName = d.Name()
+			out = append(out, info)
+			continue claim
 		}
-		out = append(out, m.decorate(info, driver))
 	}
 	return out, nil
 }
 
 // Open opens the device described by info. The driver is resolved
-// either by DriverName (when set) or by re-running Match. The
+// by DriverName — which Scan stamps on every entry — and the
 // returned Device owns its Transport; callers close it via
 // Device.Close.
+//
+// Callers typically obtain info from Scan and apply whatever
+// selection logic is appropriate for their use case (e.g. pick a
+// specific VID/PID, the first entry, a configuration value, etc.).
+// Manager does not impose a "pick the first device" convenience
+// method, because the right answer is application-specific.
 func (m *Manager) Open(info DeviceInfo) (Device, error) {
-	driver := m.driverFor(info)
+	var driver Driver
+	for _, d := range m.drivers {
+		if d.Name() == info.DriverName {
+			driver = d
+			break
+		}
+	}
 	if driver == nil {
 		return nil, ErrNoDevices
 	}
 
-	info = m.decorate(info, driver)
 	transport, err := m.opener(info)
 	if err != nil {
 		return nil, err
@@ -105,51 +122,4 @@ func (m *Manager) Open(info DeviceInfo) (Device, error) {
 		return nil, err
 	}
 	return device, nil
-}
-
-// OpenFirst scans and opens the first matching device. Useful for
-// single-device CLIs and quick scripts.
-func (m *Manager) OpenFirst() (Device, error) {
-	devices, err := m.Scan()
-	if err != nil {
-		return nil, err
-	}
-	if len(devices) == 0 {
-		return nil, ErrNoDevices
-	}
-	return m.Open(devices[0])
-}
-
-func (m *Manager) firstMatchingDriver(info DeviceInfo) Driver {
-	for _, d := range m.drivers {
-		if d.Match(info) {
-			return d
-		}
-	}
-	return nil
-}
-
-func (m *Manager) driverFor(info DeviceInfo) Driver {
-	if info.DriverName != "" {
-		for _, d := range m.drivers {
-			if d.Name() == info.DriverName && d.Match(info) {
-				return d
-			}
-		}
-	}
-	return m.firstMatchingDriver(info)
-}
-
-// decorate runs the optional Describer hook on the driver and
-// stamps DriverName. Drivers that need to fill in vendor-specific
-// fields (e.g. Model) implement an unexported Describe via type
-// assertion below.
-func (m *Manager) decorate(info DeviceInfo, driver Driver) DeviceInfo {
-	if d, ok := driver.(interface {
-		Describe(DeviceInfo) DeviceInfo
-	}); ok {
-		info = d.Describe(info)
-	}
-	info.DriverName = driver.Name()
-	return info
 }

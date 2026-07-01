@@ -133,8 +133,16 @@ type Driver interface {
 
 	// Match reports whether the driver can handle the device.
 	// Match is consulted by Manager.Scan to filter raw scanner
-	// output and by Manager.Open to re-select a driver.
+	// output.
 	Match(DeviceInfo) bool
+
+	// Describe enriches a raw DeviceInfo with driver-specific
+	// fields, typically Model. Manager.Scan calls Describe on the
+	// claiming driver so the returned DeviceInfo carries everything
+	// a caller needs (vendor type, friendly label, etc.) without
+	// having to ask the driver separately. Drivers that have
+	// nothing to add may return info unchanged.
+	Describe(DeviceInfo) DeviceInfo
 
 	// Open constructs a Device backed by the given transport. The
 	// manager owns the transport and will close it if Open fails.

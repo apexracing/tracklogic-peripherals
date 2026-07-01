@@ -30,18 +30,18 @@ func (Driver) Match(info hpr.DeviceInfo) bool {
 }
 
 // Describe sets DeviceInfo.Model to the corresponding Simagic
-// Model. It is called by Manager.decorate via the unexported
-// Describe hook.
+// Model. It implements hpr.Driver and is called by Manager.Scan
+// once the device has been claimed.
 func (Driver) Describe(info hpr.DeviceInfo) hpr.DeviceInfo {
 	info.Model = matchModel(info.VendorID, info.ProductID, info.FriendlyName)
 	return info
 }
 
-// Open implements hpr.Driver. It also performs an initial
-// "all-stop" sequence over the transport so the device starts in
-// a known quiet state.
+// Open implements hpr.Driver. It performs an initial "all-stop"
+// sequence over the transport so the device starts in a known
+// quiet state. Caller is expected to pass a DeviceInfo that has
+// already been enriched by Describe (Manager.Scan does this).
 func (d Driver) Open(info hpr.DeviceInfo, transport hpr.Transport) (hpr.Device, error) {
-	info = d.Describe(info)
 	dev := &device{
 		info:      info,
 		transport: transport,

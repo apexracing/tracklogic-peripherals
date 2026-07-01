@@ -23,17 +23,10 @@ func (d fakeDriver) Name() string { return d.name }
 
 func (d fakeDriver) Match(DeviceInfo) bool { return d.match }
 
+func (d fakeDriver) Describe(info DeviceInfo) DeviceInfo { return info }
+
 func (d fakeDriver) Open(DeviceInfo, Transport) (Device, error) {
 	return nil, errors.New("not used")
-}
-
-type describerDriver struct {
-	fakeDriver
-	describe func(DeviceInfo) DeviceInfo
-}
-
-func (d describerDriver) Describe(info DeviceInfo) DeviceInfo {
-	return d.describe(info)
 }
 
 func TestManager_ScanFiltersByDriverMatch(t *testing.T) {
@@ -87,7 +80,7 @@ func TestManager_DriverRegistrationOrderWins(t *testing.T) {
 
 func TestManager_OpenReusesDriverName(t *testing.T) {
 	// The scan stamps DriverName; Open must use it to pick the
-	// same driver even when multiple drivers match.
+	// same driver even when multiple drivers are registered.
 	openCount := 0
 	tracker := trackerDriver{
 		fakeDriver: fakeDriver{name: "track", match: true},
@@ -98,8 +91,11 @@ func TestManager_OpenReusesDriverName(t *testing.T) {
 		return stubTransport{}, nil
 	}
 	m := NewManager(
-		WithDrivers(tracker),
-		WithDeviceScanner(staticScanner{devices: []DeviceInfo{{DevicePath: "x", DriverName: "track"}}}),
+		WithDrivers(
+			tracker,
+			fakeDriver{name: "other", match: true},
+		),
+		WithDeviceScanner(staticScanner{devices: []DeviceInfo{{DevicePath: "x"}}}),
 		WithTransportOpener(fakeOpener),
 	)
 	dev, err := m.Open(DeviceInfo{DevicePath: "x", DriverName: "track"})
@@ -115,19 +111,19 @@ func TestManager_OpenReusesDriverName(t *testing.T) {
 	}
 }
 
-func TestManager_OpenFirstReturnsErrNoDevices(t *testing.T) {
+func TestManager_OpenReturnsErrNoDevicesForUnknownDriver(t *testing.T) {
 	m := NewManager(
-		WithDrivers(fakeDriver{name: "picky", match: false}),
+		WithDrivers(fakeDriver{name: "known", match: true}),
 		WithDeviceScanner(staticScanner{}),
 	)
-	_, err := m.OpenFirst()
+	_, err := m.Open(DeviceInfo{DevicePath: "x", DriverName: "ghost"})
 	if !errors.Is(err, ErrNoDevices) {
-		t.Fatalf("OpenFirst: got %v, want ErrNoDevices", err)
+		t.Fatalf("Open: got %v, want ErrNoDevices", err)
 	}
 }
 
-func TestManager_DecorateAppliesDescriber(t *testing.T) {
-	dd := describerDriver{
+func TestManager_DescribeAppliedByClaimingDriver(t *testing.T) {
+	dd := descriptorDriver{
 		fakeDriver: fakeDriver{name: "d", match: true},
 		describe: func(info DeviceInfo) DeviceInfo {
 			info.Model = "decorated"
@@ -145,6 +141,17 @@ func TestManager_DecorateAppliesDescriber(t *testing.T) {
 	if got[0].DriverName != "d" {
 		t.Fatalf("DriverName = %q, want d", got[0].DriverName)
 	}
+}
+
+// descriptorDriver wraps a fakeDriver to override Describe, used
+// to verify that Scan calls Describe on the claiming driver.
+type descriptorDriver struct {
+	fakeDriver
+	describe func(DeviceInfo) DeviceInfo
+}
+
+func (d descriptorDriver) Describe(info DeviceInfo) DeviceInfo {
+	return d.describe(info)
 }
 
 // trackerDriver counts how many times Open is called, for
