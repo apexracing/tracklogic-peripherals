@@ -149,32 +149,33 @@ var ErrUnsupported = ...
 
 ## 架构
 
-```
-调用方
-  │
-  │  hpr.NewManager(WithDrivers(simagic.NewDriver()))
-  │  mgr.Scan() → []ScannedDevice
-  │  sd.Open()   → hpr.Device
-  ▼
-┌────────────────────────────────────────────────────────┐
-│  pkg/hpr                                               │
-│  ──────                                                │
-│   types.go   Target / State / Command / DeviceInfo /   │
-│              ScannedDevice / Device / Driver / 错误    │
-│   manager.go Manager + WithDrivers + Scan              │
-│              + init() 装配 Windows HID 扫描            │
-└──────┬────────────────────────────────────────┬────────┘
-       │                                        │
-       │ 调用                                   │ 打开
-       ▼ 驱动                                    ▼
-┌──────────────┐                        ┌───────────────────┐
-│ pkg/hpr/driver│                        │ internal/hidtransport│
-│  /simagic    │ ──── 直接 import ────▶ │ windows.go         │
-│              │                        │  Win32 HID backend │
-└──────────────┘                        └───────────────────┘
+```mermaid
+flowchart TD
+    caller["调用方代码"]
+
+    subgraph hpr["pkg/hpr (公共 API)"]
+        manager["Manager<br/>Scan / WithDrivers"]
+        types["Target / State / Command<br/>DeviceInfo / ScannedDevice<br/>Device / Driver / errors"]
+    end
+
+    subgraph driverLayer["pkg/hpr/driver/&lt;vendor&gt;"]
+        drv["Driver<br/>Match / Describe / Open"]
+        dev["hpr.Device 实现<br/>Vibrate / Stop / Close"]
+    end
+
+    subgraph transportLayer["internal/hidtransport"]
+        hid["Win32 HID 后端<br/>Scanner / Transport"]
+    end
+
+    caller -->|"NewManager +<br/>WithDrivers(drivers)"| manager
+    manager -->|"Scan() → ScannedDevice"| types
+    caller -->|"sd.Open()"| drv
+    drv -->|"构造"| dev
+    dev -->|"SetFeature"| hid
+    hid -.->|"Open / Scan"| drv
 ```
 
-`hpr` 不知道也不关心下面是哪家驱动、`hidtransport` 不知道也不关心上面是哪家驱动。两层解耦靠 driver 包同时 import 这两个实现。
+驱动作者只看到左侧的 `Driver` 接口和右侧的 `hidtransport` Win32 API：`pkg/hpr` 对厂家无知，`internal/hidtransport` 对上层无知。中间的 driver 包是同时 import 二者的那一层。
 
 ## 扩展：编写新驱动
 
