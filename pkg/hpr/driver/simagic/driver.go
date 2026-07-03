@@ -18,8 +18,8 @@ import (
 // rather than rejecting out-of-range values; they live here (not
 // in pkg/hpr) because only Simagic encodes them onto the wire.
 const (
-	MinFrequency uint8 = 0
-	MaxFrequency uint8 = 50
+	MinFrequency uint8 = 10
+	MaxFrequency uint8 = 200
 	MinAmplitude uint8 = 0
 	MaxAmplitude uint8 = 100
 )

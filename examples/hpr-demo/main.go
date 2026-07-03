@@ -26,7 +26,7 @@ import (
 
 func main() {
 	channel := flag.Int("ch", int(hpr.TargetBrake), "Channel: 0=Clutch, 1=Brake, 2=Throttle")
-	freq := flag.Uint("f", uint(simagic.MaxFrequency), "Frequency 0-50; larger values are clamped")
+	freq := flag.Uint("f", uint(simagic.MaxFrequency), "Frequency 10-200; out-of-range values are clamped")
 	amp := flag.Uint("a", uint(simagic.MaxAmplitude), "Amplitude 0-100")
 	duration := flag.Duration("d", 2*time.Second, "Duration (e.g. 3s, 500ms); 0 waits for Ctrl+C")
 	list := flag.Bool("list", false, "List connected devices only")

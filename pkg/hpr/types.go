@@ -66,7 +66,7 @@ const (
 type Command struct {
 	Target    Target
 	State     State
-	Frequency uint8 // 0..50
+	Frequency uint8 // 10..200
 	Amplitude uint8 // 0..100
 }
 
