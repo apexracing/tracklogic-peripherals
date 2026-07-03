@@ -97,8 +97,9 @@ func (d *device) Info() hpr.DeviceInfo {
 	return d.info
 }
 
-// Vibrate implements hpr.Device. Repeated identical commands are
-// deduplicated at the wire level.
+// Vibrate implements hpr.Device. Repeated On commands are still sent
+// because Simagic HPR devices stop after their internal watchdog if
+// the host does not refresh the vibration command.
 func (d *device) Vibrate(cmd hpr.Command) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -184,7 +185,9 @@ func (d *device) stopAll(force bool) error {
 func (d *device) sendLocked(cmd normalizedCommand, force bool) error {
 	if !force {
 		if last, ok := d.last[cmd.target]; ok && last == cmd {
-			return nil
+			if cmd.state == hpr.Off {
+				return nil
+			}
 		}
 	}
 	packet := vibrateCommand{
