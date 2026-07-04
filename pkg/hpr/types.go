@@ -127,6 +127,13 @@ type Device interface {
 	// Close releases the device and the underlying transport. It is
 	// safe to call more than once; subsequent calls return nil.
 	Close() error
+
+	// ReadPedal reads the current normalised position of a pedal axis.
+	// It returns a value in [0.0, 1.0] where 0.0 is fully released
+	// and 1.0 is fully pressed. Passing an invalid target is a
+	// programming error and returns an error. Drivers that do not
+	// support input reading return ErrUnsupported.
+	ReadPedal(Target) (float64, error)
 }
 
 // Driver claims devices and opens them as Device instances. Drivers

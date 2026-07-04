@@ -27,6 +27,13 @@ const (
 // Driver is the Simagic implementation of hpr.Driver.
 type Driver struct{}
 
+// RawInputReader is an optional interface implemented by simagic
+// Device handles for reading raw HID input report bytes. This is
+// useful when reverse-engineering an unknown device's report format.
+type RawInputReader interface {
+	ReadRawInput() ([]byte, error)
+}
+
 // NewDriver returns a Simagic Driver. It is safe to register
 // multiple instances; Manager.Match is per-Driver and order is
 // preserved.
@@ -59,10 +66,22 @@ func (Driver) Open(info hpr.DeviceInfo) (hpr.Device, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Query the HID report descriptor to discover the input report
+	// length, which the driver uses to size its read buffer.
+	inputReportLen := 0
+	if pp, err := t.PreparsedData(); err == nil {
+		if caps, err := pp.Capabilities(); err == nil {
+			inputReportLen = int(caps.InputReportByteLength)
+		}
+		pp.Close()
+	}
+
 	dev := &device{
-		info:      info,
-		transport: t,
-		last:      make(map[hpr.Target]normalizedCommand, 3),
+		info:           info,
+		transport:      t,
+		last:           make(map[hpr.Target]normalizedCommand, 3),
+		inputReportLen: inputReportLen,
 	}
 	if err := dev.stopAll(true); err != nil {
 		_ = t.Close()
@@ -73,11 +92,13 @@ func (Driver) Open(info hpr.DeviceInfo) (hpr.Device, error) {
 
 // device is the Simagic implementation of hpr.Device.
 type device struct {
-	mu        sync.Mutex
-	info      hpr.DeviceInfo
-	transport *hidtransport.Transport
-	closed    bool
-	last      map[hpr.Target]normalizedCommand
+	mu             sync.Mutex
+	info           hpr.DeviceInfo
+	transport      *hidtransport.Transport
+	closed         bool
+	last           map[hpr.Target]normalizedCommand
+	inputReportLen int  // HID InputReportByteLength from capabilities
+	flushed        bool // whether FlushQueue has been called for input
 }
 
 type normalizedCommand struct {
@@ -160,6 +181,38 @@ func (d *device) Pulse(target hpr.Target, frequency, amplitude uint8, duration t
 	return d.Stop(target)
 }
 
+// ReadPedal implements hpr.Device. It reads the current normalised
+// pedal-axis position from the device's HID input reports.
+// The first call flushes stale input reports from the queue.
+func (d *device) ReadPedal(target hpr.Target) (float64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.ensureOpenLocked(); err != nil {
+		return 0, err
+	}
+	if !target.Valid() {
+		return 0, fmt.Errorf("simagic: invalid target: %d", target)
+	}
+	raw, err := d.readInputLocked()
+	if err != nil {
+		return 0, err
+	}
+	in := parsePedalInput(raw)
+	return in.normalised(uint8(target)), nil
+}
+
+// ReadRawInput reads and returns the raw HID input report bytes.
+// This is useful when reverse-engineering the report format of an
+// unknown device. The first call flushes stale reports.
+func (d *device) ReadRawInput() ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.ensureOpenLocked(); err != nil {
+		return nil, err
+	}
+	return d.readInputLocked()
+}
+
 // --- internals ---
 
 func (d *device) ensureOpenLocked() error {
@@ -167,6 +220,29 @@ func (d *device) ensureOpenLocked() error {
 		return hpr.ErrDeviceClosed
 	}
 	return nil
+}
+
+// readInputLocked reads a single HID input report from the interrupt
+// IN endpoint. On first call, it flushes the queue to discard any
+// stale reports that accumulated before the caller started polling.
+// Caller must hold d.mu.
+func (d *device) readInputLocked() ([]byte, error) {
+	if !d.flushed {
+		if err := d.transport.FlushQueue(); err != nil {
+			return nil, err
+		}
+		d.flushed = true
+	}
+	bufLen := d.inputReportLen
+	if bufLen <= 0 {
+		bufLen = 64 // sensible fallback
+	}
+	buf := make([]byte, bufLen)
+	n, err := d.transport.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
 }
 
 // stopAll sends an Off packet for every axis the device exposes.

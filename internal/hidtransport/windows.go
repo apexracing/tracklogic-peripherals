@@ -143,6 +143,18 @@ type Capabilities struct {
 	NumberFeatureValueCaps    uint16
 }
 
+// ValueCap describes a single HID input value (axis, dial, etc.) as
+// reported by HidP_GetValueCaps.
+type ValueCap struct {
+	UsagePage  uint16
+	Usage      uint16
+	ReportID   uint8
+	BitField   uint16 // byte offset in report
+	BitSize    uint16 // size in bits
+	LogicalMin int32
+	LogicalMax int32
+}
+
 // PreparsedData holds an opaque preparsed-data handle. Release it
 // with Close.
 type PreparsedData struct {
@@ -230,6 +242,9 @@ var (
 	procHidDSetNumInputBuffers    = modHid.NewProc("HidD_SetNumInputBuffers")
 
 	procHidPGetCaps = modHid.NewProc("HidP_GetCaps")
+	procHidPGetValueCaps = modHid.NewProc("HidP_GetValueCaps")
+	procHidPGetUsageValue = modHid.NewProc("HidP_GetUsageValue")
+	procHidPGetUsages = modHid.NewProc("HidP_GetUsages")
 
 	procSetupDiGetClassDevs             = modSetupapi.NewProc("SetupDiGetClassDevsW")
 	procSetupDiEnumDeviceInterfaces     = modSetupapi.NewProc("SetupDiEnumDeviceInterfaces")
@@ -786,6 +801,149 @@ func (p *PreparsedData) Capabilities() (Capabilities, error) {
 		NumberFeatureButtonCaps:   caps.NumberFeatureButtonCaps,
 		NumberFeatureValueCaps:    caps.NumberFeatureValueCaps,
 	}, nil
+}
+
+// ValueCaps returns all HID input value capabilities (axes, dials, etc.)
+// described by the preparsed data. Only input values (HidP_Input) are
+// enumerated.
+func (p *PreparsedData) ValueCaps() ([]ValueCap, error) {
+	if p == nil || p.handle == 0 {
+		return nil, errPreparsedClosed
+	}
+
+	// Get number of input value caps.
+	var caps hidPCaps
+	ret, _, _ := procHidPGetCaps.Call(
+		uintptr(p.handle),
+		uintptr(unsafe.Pointer(&caps)),
+	)
+	if ret == 0 {
+		return nil, errGetCapsFailed
+	}
+	n := int(caps.NumberInputValueCaps)
+	if n == 0 {
+		return nil, nil
+	}
+
+	// HIDP_VALUE_CAPS on 64-bit Windows; allocate a generous buffer.
+	bufLen := n * 128
+	buf := make([]byte, bufLen)
+	numCaps := uint32(n)
+
+	ret, _, callErr := procHidPGetValueCaps.Call(
+		uintptr(0), // HidP_Input
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&numCaps)),
+		uintptr(p.handle),
+	)
+	if ret == 0 {
+		if callErr != syscall.Errno(0) {
+			return nil, errCall("HidP_GetValueCaps", callErr)
+		}
+		return nil, stringError("hidtransport: HidP_GetValueCaps failed")
+	}
+
+	// Try to detect the true struct stride by looking for the second
+	// entry's UsagePage (should be 0x0001 for Generic Desktop).
+	winStructSize := 64 // initial guess
+	for try := 64; try <= 120; try += 8 {
+		if try+2 <= len(buf) {
+			up := uint16(buf[try]) | uint16(buf[try+1])<<8
+			if up == 0x0001 || up == 0x0002 {
+				winStructSize = try
+				break
+			}
+		}
+	}
+
+	out := make([]ValueCap, 0, numCaps)
+	for i := uint32(0); i < numCaps; i++ {
+		off := int(i) * winStructSize
+		if off+60 > len(buf) {
+			break
+		}
+		usagePage := uint16(buf[off]) | uint16(buf[off+1])<<8
+		reportID := buf[off+2]
+		bitField := uint16(buf[off+4]) | uint16(buf[off+5])<<8
+		bitSize := uint16(buf[off+18]) | uint16(buf[off+19])<<8
+		logicalMin := int32(uint32(buf[off+40]) | uint32(buf[off+41])<<8 | uint32(buf[off+42])<<16 | uint32(buf[off+43])<<24)
+		logicalMax := int32(uint32(buf[off+44]) | uint32(buf[off+45])<<8 | uint32(buf[off+46])<<16 | uint32(buf[off+47])<<24)
+		usage := uint16(buf[off+56]) | uint16(buf[off+57])<<8
+
+		out = append(out, ValueCap{
+			UsagePage:  usagePage,
+			Usage:      usage,
+			ReportID:   reportID,
+			BitField:   bitField,
+			BitSize:    bitSize,
+			LogicalMin: logicalMin,
+			LogicalMax: logicalMax,
+		})
+	}
+	return out, nil
+}
+
+// GetUsageValue uses HidP_GetUsageValue to extract a single HID control
+// value from a report, identified by its UsagePage and Usage.
+// This is the proper way to read HID values (used by games).
+func GetUsageValue(pp *PreparsedData, report []byte, usagePage, usage uint16) (uint32, error) {
+	if pp == nil || pp.handle == 0 {
+		return 0, errPreparsedClosed
+	}
+	var val uint32
+	ret, _, callErr := procHidPGetUsageValue.Call(
+		uintptr(0), // HidP_Input
+		uintptr(usagePage),
+		uintptr(0), // LinkCollection (0 = top-level)
+		uintptr(usage),
+		uintptr(unsafe.Pointer(&val)),
+		uintptr(pp.handle),
+		uintptr(unsafe.Pointer(&report[0])),
+		uintptr(len(report)),
+	)
+	if ret != 0 {
+		// NTSTATUS: 0 = success, 0xC0110001 = usage not found
+		if ret == 0xC0110001 || ret == 0xC0110002 {
+			return 0, nil
+		}
+		if callErr != syscall.Errno(0) {
+			return 0, errCall("HidP_GetUsageValue", callErr)
+		}
+	}
+	return val, nil
+}
+
+// GetUsages uses HidP_GetUsages to list all currently pressed button
+// usages from a report. usagePage is typically 0x09 (Button).
+// maxButtons is the max number of buttons to return (typical: 128).
+func GetUsages(pp *PreparsedData, report []byte, usagePage uint16, maxButtons int) ([]uint16, error) {
+	if pp == nil || pp.handle == 0 {
+		return nil, errPreparsedClosed
+	}
+	buf := make([]uint16, maxButtons)
+	num := uint32(maxButtons)
+	ret, _, callErr := procHidPGetUsages.Call(
+		uintptr(0), // HidP_Input
+		uintptr(usagePage),
+		uintptr(0), // LinkCollection
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&num)),
+		uintptr(pp.handle),
+		uintptr(unsafe.Pointer(&report[0])),
+		uintptr(len(report)),
+	)
+	if ret != 0 {
+		// HIDP_STATUS_USAGE_NOT_FOUND (0xC0110001) = no buttons pressed — OK.
+		// HIDP_STATUS_SUCCESS (0) = success.
+		if ret == 0xC0110001 {
+			return nil, nil
+		}
+		if callErr != syscall.Errno(0) {
+			return nil, errCall("HidP_GetUsages", callErr)
+		}
+		return nil, nil
+	}
+	return buf[:num], nil
 }
 
 // --- Internal helpers ---

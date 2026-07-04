@@ -1,5 +1,7 @@
 package simagic
 
+import "fmt"
+
 // Protocol constants for the Simagic vibration feature report.
 // These are private to the driver and intentionally not exported.
 
@@ -81,4 +83,71 @@ type vibrateCommand struct {
 	Frequency   uint8
 	Amplitude   uint8
 	_           [58]byte // pad to 64 bytes
+}
+
+// --- Input report parsing ---
+
+// pedalInput holds the raw parsed pedal axis values extracted from
+// a HID input report.
+type pedalInput struct {
+	clutch   uint16
+	brake    uint16
+	throttle uint16
+	rawMax   uint16 // max raw value for normalisation
+}
+
+// parsePedalInput decodes a Simagic HID input report into per-axis
+// raw values (0–4095, 12-bit). Report layout:
+//
+//	byte 0:    report ID (0x01)
+//	bytes 1–2: clutch  (LE uint16, 0–0x0FFF)
+//	bytes 3–4: brake   (LE uint16, 0–0x0FFF)
+//	bytes 5–6: throttle(LE uint16, 0–0x0FFF)
+func parsePedalInput(raw []byte) pedalInput {
+	const axisMax = 0x0FFF
+
+	if len(raw) < 7 {
+		return pedalInput{rawMax: axisMax}
+	}
+	base := 1 // skip report ID
+	return pedalInput{
+		clutch:   leUint16(raw, base),
+		brake:    leUint16(raw, base+2),
+		throttle: leUint16(raw, base+4),
+		rawMax:   axisMax,
+	}
+}
+
+// normalised returns the axis value as a float64 in [0.0, 1.0].
+func (p pedalInput) normalised(target uint8) float64 {
+	if p.rawMax == 0 {
+		return 0
+	}
+	var raw uint16
+	switch target {
+	case 0:
+		raw = p.clutch
+	case 1:
+		raw = p.brake
+	case 2:
+		raw = p.throttle
+	default:
+		return 0
+	}
+	return float64(raw) / float64(p.rawMax)
+}
+
+// FormatDebug returns a one-line debug string showing the raw parsed
+// values. This is intentionally exported so demo code can call it
+// after obtaining a RawInputReport.
+func FormatDebug(raw []byte) string {
+	p := parsePedalInput(raw)
+	return fmt.Sprintf("raw{c=%d,b=%d,t=%d,max=%d}", p.clutch, p.brake, p.throttle, p.rawMax)
+}
+
+func leUint16(b []byte, off int) uint16 {
+	if off < 0 || off+1 >= len(b) {
+		return 0
+	}
+	return uint16(b[off]) | uint16(b[off+1])<<8
 }
