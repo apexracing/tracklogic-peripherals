@@ -2,6 +2,17 @@
 
 本项目的所有重要变更都记录在此文件中。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [未发布]
+
+### 新增
+
+- `pkg/controller`：基于 Windows DirectInput 的通用游戏控制器数字按钮输入，支持后台非独占采集、按下/松开边沿、绑定捕获、热插拔、输入丢失恢复和断线释放。
+- `examples/controller-demo`：提供 DirectInput 设备列表、按钮绑定和实时监控。
+
+### 变更
+
+- 移除 `hpr-demo` 中依赖固定 HID Report 字节偏移的实验性方向盘绑定代码；踏板振动和原始 HID 诊断保持不变。
+
 ## [1.0.0] - 2026-07-01
 
 ### 新增

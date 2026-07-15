@@ -2,7 +2,9 @@
 
 赛车模拟器外设的 Go 驱动库。
 
-调用方构造 `hpr.Manager`，注册一个或多个厂家驱动，调 `Scan` 拿到当前可用的设备列表，再对每个 `ScannedDevice` 调 `Open` 拿一个 `hpr.Device` 来发振动命令。厂家驱动作为 `pkg/hpr/driver/<vendor>/` 子包存在，是调用方和真实硬件之间的薄薄一层。
+仓库包含两类相互独立的能力：`pkg/hpr` 负责厂家相关的踏板振动输出，`pkg/controller` 通过 Windows DirectInput 提供厂家无关的方向盘数字按钮输入。
+
+振动调用方构造 `hpr.Manager`，注册一个或多个厂家驱动，调 `Scan` 拿到当前可用的设备列表，再对每个 `ScannedDevice` 调 `Open` 拿一个 `hpr.Device` 来发振动命令。厂家驱动作为 `pkg/hpr/driver/<vendor>/` 子包存在，是调用方和真实硬件之间的薄薄一层。
 
 驱动作者的责任只有三件事：
 
@@ -19,6 +21,8 @@
 | 厂家    | 包                       | 型号                                          |
 | ------- | ------------------------ | --------------------------------------------- |
 | Simagic | `pkg/hpr/driver/simagic` | P500、P700、P1000、P2000、Alpha Pedal Neo     |
+
+方向盘按钮输入不使用厂家表：Windows DirectInput 能枚举到的游戏控制器都由 `pkg/controller` 统一提供 0–127 数字按钮的按下/松开事件。
 
 ## 安装
 
@@ -75,6 +79,53 @@ func main() {
 4. 选一个 `ScannedDevice`，调它的 `Open` 拿到 `Device`
 5. `Vibrate` / `Stop` / `Close`
 
+## DirectInput 方向盘按钮
+
+`controller.Manager` 使用后台、非独占 DirectInput，不会抢占游戏中的方向盘。TrackLogic 应在 Wails 原生主窗口创建后传入 HWND，并在窗口销毁前关闭 Manager：
+
+```go
+import (
+    "context"
+
+    "github.com/apexracing/tracklogic-peripherals/pkg/controller"
+)
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+buttons := controller.NewManager(
+    controller.WithWindowHandle(uintptr(mainWindow.NativeWindow())),
+)
+if err := buttons.Start(ctx); err != nil {
+    return err
+}
+defer buttons.Close() // 必须早于 mainWindow 的销毁
+
+binding, err := buttons.Capture(ctx) // 设置页：等待下一次按下
+if err != nil {
+    return err
+}
+
+go func() {
+    for event := range buttons.Events() {
+        if !binding.Matches(event) {
+            continue
+        }
+        switch event.State {
+        case controller.Pressed:
+            asr.StartCapture()
+        case controller.Released:
+            audio := asr.StopCapture()
+            go transcribeAndInvokeAgent(audio)
+        }
+    }
+}()
+```
+
+传入窗口必须是当前进程拥有的顶层窗口，并且在 Manager 生命周期内保持有效。主窗口可以隐藏或最小化；不要传会按 HUD 模式关闭、重建的窗口。没有传 `WithWindowHandle` 时，库会创建自己的隐藏顶层窗口，适合 CLI 和测试工具。
+
+`Binding.Button` 和 `ButtonEvent.Button` 都是 DirectInput 的零基编号；设置界面通常显示为 `Button + 1`。绑定持久化由 TrackLogic 负责。
+
 ## 命令行示例
 
 `examples/hpr-demo` 是可独立运行的示例程序，`go run` 或 `go build` 都行：
@@ -87,9 +138,17 @@ go build -o hpr-demo.exe ./examples/hpr-demo
 ./hpr-demo.exe -list
 ```
 
+DirectInput 按钮诊断：
+
+```sh
+go run ./examples/controller-demo -list
+go run ./examples/controller-demo -bind
+go run ./examples/controller-demo -monitor
+```
+
 ## 公共 API
 
-`pkg/hpr` 包对外的全部类型：
+`pkg/hpr` 包对外的振动 API：
 
 ```go
 // 命令数据
@@ -146,6 +205,8 @@ var ErrUnsupported = ...
 ```
 
 整个 surface 就这些。
+
+`pkg/controller` 的按钮 API 由 `DeviceInfo`、`ButtonEvent`、`Binding`、`Manager`、`Pressed` 和 `Released` 组成；详见上面的 DirectInput 示例及 Go 文档。
 
 ## 架构
 
@@ -250,7 +311,7 @@ mgr := hpr.NewManager(hpr.WithDrivers(
 
 ## 测试
 
-仓库**没有单元测试**。这是驱动层代码，单元测试只能验证"代码按我以为的方式组合"，无法验证"设备真的响应"。`go vet` 和 `go build` 是仅有的静态检查；回归靠真硬件手动验证：
+仓库为 DirectInput 管理器、按钮边沿、绑定捕获、断线释放、Windows ABI 和隐藏窗口生命周期提供单元测试。真实设备的 USB/驱动行为仍需硬件回归：
 
 ```sh
 # 1. 插上踏板，确认能看到
@@ -258,6 +319,9 @@ go run ./examples/hpr-demo -list
 
 # 2. 让刹车震 2 秒
 go run ./examples/hpr-demo -ch 1 -f 30 -a 80 -d 2s
+
+# 3. 检查方向盘按钮按下/松开
+go run ./examples/controller-demo -monitor
 ```
 
 `StopAll`、`OpenFirst`、`Capabilities`、`DeviceInfo.DriverName` 之类的方法/字段在 1.0.0 之前都被去掉了——它们曾是"未来扩展性"的占位，但实际用途都是臆想。库只保留调用方真实需要的东西。
@@ -267,6 +331,7 @@ go run ./examples/hpr-demo -ch 1 -f 30 -a 80 -d 2s
 ```
 .
 ├── pkg/
+│   ├── controller/                    # DirectInput 按钮公共 API + Windows 后端
 │   └── hpr/
 │       ├── doc.go                       # 包注释
 │       ├── types.go                     # 公开 API
@@ -277,7 +342,8 @@ go run ./examples/hpr-demo -ch 1 -f 30 -a 80 -d 2s
 │   └── hidtransport/
 │       └── windows.go                   # Win32 HID 后端
 └── examples/
-    └── hpr-demo/                        # 可运行的示例程序
+    ├── controller-demo/                 # DirectInput 列表/绑定/监控
+    └── hpr-demo/                        # 踏板振动示例程序
 ```
 
 ## 许可证
