@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"runtime"
 	"sync"
@@ -20,8 +21,12 @@ const (
 
 	di8DevClassGameCtrl = 4
 	diedflAttachedOnly  = 0x00000001
+	didftAxis           = 0x00000003
+	didftAbsAxis        = 0x00000002
 	didftButton         = 0x0000000c
 	diphDevice          = 0
+	diphByID            = 2
+	didfAbsAxis         = 0x00000001
 
 	disclNonExclusive = 0x00000002
 	disclBackground   = 0x00000008
@@ -32,12 +37,14 @@ const (
 	diBufferOverflow = 0x00000001
 
 	dipropBufferSize = 1
+	dipropRange      = 4
 
 	gaRoot = 2
 
 	pollInterval   = 5 * time.Millisecond
 	rescanInterval = 2 * time.Second
 	deviceBuffer   = 256
+	axisRawMaximum = 65535
 )
 
 var (
@@ -144,7 +151,18 @@ type runtimeDevice struct {
 	device      *iDirectInputDevice8W
 	initialized bool
 	buttons     []uint8 // custom data offset -> DirectInput button instance
-	state       [maxButtons]bool
+	buttonState [maxButtons]bool
+	axes        []runtimeAxis
+	dataSize    int
+}
+
+type runtimeAxis struct {
+	instance   uint16
+	name       string
+	guid       windows.GUID
+	objectType uint32
+	raw        uint32
+	hasState   bool
 }
 
 func (r *directInputRuntime) syncDevices(sink backendSink) error {
@@ -166,7 +184,7 @@ func (r *directInputRuntime) syncDevices(sink backendSink) error {
 		}
 
 		if !device.initialized {
-			if err := r.initializeDevice(device); err != nil {
+			if err := r.initializeDevice(device, sink); err != nil {
 				sink.report(fmt.Errorf("controller: open %s: %w", deviceName(descriptor), err))
 				continue
 			}
@@ -191,7 +209,7 @@ func (r *directInputRuntime) syncDevices(sink backendSink) error {
 	return nil
 }
 
-func (r *directInputRuntime) initializeDevice(target *runtimeDevice) error {
+func (r *directInputRuntime) initializeDevice(target *runtimeDevice, sink backendSink) error {
 	device, err := r.di.createDevice(&target.descriptor.guidInstance)
 	if err != nil {
 		return err
@@ -214,7 +232,29 @@ func (r *directInputRuntime) initializeDevice(target *runtimeDevice) error {
 			target.buttons = append(target.buttons, uint8(instance))
 		}
 	}
-	if len(target.buttons) == 0 {
+
+	axisObjects, err := device.enumAxes()
+	if err != nil {
+		device.release()
+		return err
+	}
+	sortAxisObjects(axisObjects)
+	target.axes = target.axes[:0]
+	seenAxes := make(map[uint16]bool, len(axisObjects))
+	for _, object := range axisObjects {
+		instance := uint16((object.objectType >> 8) & 0xffff)
+		if seenAxes[instance] || len(target.axes) >= maxAxes {
+			continue
+		}
+		seenAxes[instance] = true
+		target.axes = append(target.axes, runtimeAxis{
+			instance:   instance,
+			name:       axisObjectName(object, instance),
+			guid:       object.guidType,
+			objectType: didftAbsAxis | uint32(instance)<<8,
+		})
+	}
+	if len(target.buttons) == 0 && len(target.axes) == 0 {
 		device.release()
 		target.device = nil
 		target.initialized = true
@@ -222,9 +262,16 @@ func (r *directInputRuntime) initializeDevice(target *runtimeDevice) error {
 		return nil
 	}
 
-	if err := device.setButtonDataFormat(target.buttons); err != nil {
+	target.dataSize, err = device.setInputDataFormat(target.axes, target.buttons)
+	if err != nil {
 		device.release()
 		return err
+	}
+	for _, axis := range target.axes {
+		if err := device.setAxisRange(axis.objectType, 0, axisRawMaximum); err != nil {
+			device.release()
+			return err
+		}
 	}
 	if err := device.setBufferSize(deviceBuffer); err != nil {
 		device.release()
@@ -238,10 +285,23 @@ func (r *directInputRuntime) initializeDevice(target *runtimeDevice) error {
 	target.device = device
 	target.initialized = true
 	target.refreshInfo()
-	if err := target.acquireAndReconcile(nil, false); err != nil {
+	if err := target.acquireAndReconcile(sink, false); err != nil {
 		// A temporarily unavailable controller remains configured and is
 		// reacquired from the polling loop.
 		return nil
+	}
+	// Some wheel/pedal drivers publish their first real axis frame only after
+	// one polling interval. Refresh once more before Start reports readiness so
+	// CaptureAxis cannot bind the transition from the default center position.
+	for range 2 {
+		time.Sleep(pollInterval)
+		if hr := target.device.poll(); hresultFailed(hr) {
+			return nil
+		}
+		if err := target.reconcile(sink, false); err != nil {
+			return nil
+		}
+		target.device.drainDeviceData()
 	}
 	return nil
 }
@@ -267,11 +327,12 @@ func (d *runtimeDevice) refreshInfo() {
 		InstanceName: windows.UTF16ToString(d.descriptor.instanceName[:]),
 		ProductName:  windows.UTF16ToString(d.descriptor.productName[:]),
 		ButtonCount:  len(d.buttons),
+		AxisCount:    len(d.axes),
 	}
 }
 
 func (d *runtimeDevice) poll(sink backendSink) {
-	if d.device == nil || len(d.buttons) == 0 {
+	if d.device == nil || d.dataSize == 0 {
 		return
 	}
 
@@ -291,12 +352,19 @@ func (d *runtimeDevice) poll(sink backendSink) {
 
 		for i := uint32(0); i < count; i++ {
 			record := records[i]
-			if int(record.offset) >= len(d.buttons) {
+			axisBytes := uint32(len(d.axes) * 4)
+			if record.offset < axisBytes && record.offset%4 == 0 {
+				axisIndex := int(record.offset / 4)
+				d.emitAxisIfChanged(sink, axisIndex, record.data)
 				continue
 			}
-			button := d.buttons[record.offset]
+			buttonOffset := int(record.offset - axisBytes)
+			if buttonOffset < 0 || buttonOffset >= len(d.buttons) {
+				continue
+			}
+			button := d.buttons[buttonOffset]
 			down := record.data&0x80 != 0
-			d.emitIfChanged(sink, button, down)
+			d.emitButtonIfChanged(sink, button, down)
 		}
 
 		if hr == diBufferOverflow {
@@ -316,6 +384,11 @@ func (d *runtimeDevice) acquireAndReconcile(sink backendSink, emit bool) error {
 	if hr := d.device.acquire(); hresultFailed(hr) {
 		return newDirectInputError("IDirectInputDevice8.Acquire", hr)
 	}
+	// Polled devices can report the DirectInput default center position until
+	// their first Poll. Establish capture baselines only from refreshed state.
+	if hr := d.device.poll(); hresultFailed(hr) {
+		return newDirectInputError("IDirectInputDevice8.Poll", hr)
+	}
 	if err := d.reconcile(sink, emit); err != nil {
 		return err
 	}
@@ -324,28 +397,41 @@ func (d *runtimeDevice) acquireAndReconcile(sink backendSink, emit bool) error {
 }
 
 func (d *runtimeDevice) reconcile(sink backendSink, emit bool) error {
-	state := make([]byte, len(d.buttons))
+	state := make([]byte, d.dataSize)
 	hr := d.device.getDeviceState(state)
 	if hresultFailed(hr) {
 		return newDirectInputError("IDirectInputDevice8.GetDeviceState", hr)
 	}
-	for offset, value := range state {
+	for index := range d.axes {
+		raw := binary.LittleEndian.Uint32(state[index*4 : index*4+4])
+		if emit {
+			d.emitAxisIfChanged(sink, index, raw)
+		} else {
+			d.axes[index].raw = raw
+			d.axes[index].hasState = true
+			if sink != nil {
+				sink.syncAxis(d.axisEvent(index, raw))
+			}
+		}
+	}
+	buttonStart := len(d.axes) * 4
+	for offset, value := range state[buttonStart:] {
 		button := d.buttons[offset]
 		down := value&0x80 != 0
 		if emit {
-			d.emitIfChanged(sink, button, down)
+			d.emitButtonIfChanged(sink, button, down)
 		} else {
-			d.state[button] = down
+			d.buttonState[button] = down
 		}
 	}
 	return nil
 }
 
-func (d *runtimeDevice) emitIfChanged(sink backendSink, button uint8, down bool) {
-	if d.state[button] == down {
+func (d *runtimeDevice) emitButtonIfChanged(sink backendSink, button uint8, down bool) {
+	if d.buttonState[button] == down {
 		return
 	}
-	d.state[button] = down
+	d.buttonState[button] = down
 	if sink == nil {
 		return
 	}
@@ -353,7 +439,7 @@ func (d *runtimeDevice) emitIfChanged(sink backendSink, button uint8, down bool)
 	if down {
 		state = Pressed
 	}
-	sink.emit(ButtonEvent{
+	sink.emitButton(ButtonEvent{
 		Device:    d.info,
 		Button:    button,
 		State:     state,
@@ -361,11 +447,41 @@ func (d *runtimeDevice) emitIfChanged(sink backendSink, button uint8, down bool)
 	})
 }
 
+func (d *runtimeDevice) emitAxisIfChanged(sink backendSink, index int, raw uint32) {
+	if index < 0 || index >= len(d.axes) {
+		return
+	}
+	axis := &d.axes[index]
+	if axis.hasState && axis.raw == raw {
+		return
+	}
+	axis.raw = raw
+	axis.hasState = true
+	if sink != nil {
+		sink.emitAxis(d.axisEvent(index, raw))
+	}
+}
+
+func (d *runtimeDevice) axisEvent(index int, raw uint32) AxisEvent {
+	if raw > axisRawMaximum {
+		raw = axisRawMaximum
+	}
+	axis := d.axes[index]
+	return AxisEvent{
+		Device:    d.info,
+		Axis:      axis.instance,
+		AxisName:  axis.name,
+		Value:     float64(raw) / float64(axisRawMaximum),
+		RawValue:  raw,
+		Timestamp: time.Now(),
+	}
+}
+
 func (d *runtimeDevice) release(sink backendSink, emitReleased bool) {
 	if emitReleased {
-		for button, down := range d.state {
+		for button, down := range d.buttonState {
 			if down {
-				d.emitIfChanged(sink, uint8(button), false)
+				d.emitButtonIfChanged(sink, uint8(button), false)
 			}
 		}
 	}
@@ -375,6 +491,26 @@ func (d *runtimeDevice) release(sink backendSink, emitReleased bool) {
 		d.device = nil
 	}
 	d.initialized = false
+}
+
+func sortAxisObjects(values []diDeviceObjectInstanceW) {
+	for i := 1; i < len(values); i++ {
+		value := values[i]
+		instance := (value.objectType >> 8) & 0xffff
+		j := i
+		for j > 0 && ((values[j-1].objectType>>8)&0xffff) > instance {
+			values[j] = values[j-1]
+			j--
+		}
+		values[j] = value
+	}
+}
+
+func axisObjectName(object diDeviceObjectInstanceW, instance uint16) string {
+	if name := windows.UTF16ToString(object.name[:]); name != "" {
+		return name
+	}
+	return fmt.Sprintf("Axis %d", instance)
 }
 
 func deviceName(descriptor diDeviceInstanceW) string {
@@ -606,6 +742,12 @@ type diPropDWORD struct {
 	data   uint32
 }
 
+type diPropRange struct {
+	header  diPropHeader
+	minimum int32
+	maximum int32
+}
+
 type diDeviceObjectData struct {
 	offset    uint32
 	data      uint32
@@ -661,7 +803,7 @@ func (d *iDirectInput8W) createDevice(guid *windows.GUID) (*iDirectInputDevice8W
 }
 
 type deviceEnumContext struct{ devices []diDeviceInstanceW }
-type objectEnumContext struct{ instances []int }
+type objectEnumContext struct{ objects []diDeviceObjectInstanceW }
 
 var (
 	callbackSequence atomic.Uintptr
@@ -692,11 +834,8 @@ func enumObjectsCallback(objectPtr unsafe.Pointer, reference uintptr) uintptr {
 		return diEnumStop
 	}
 	object := (*diDeviceObjectInstanceW)(objectPtr)
-	instance := int((object.objectType >> 8) & 0xffff)
-	if instance < maxButtons {
-		ctx := value.(*objectEnumContext)
-		ctx.instances = append(ctx.instances, instance)
-	}
+	ctx := value.(*objectEnumContext)
+	ctx.objects = append(ctx.objects, *object)
 	return diEnumContinue
 }
 
@@ -734,22 +873,58 @@ func (d *iDirectInputDevice8W) enumButtons() ([]int, error) {
 	if hresultFailed(uint32(hr)) {
 		return nil, newDirectInputError("IDirectInputDevice8.EnumObjects", uint32(hr))
 	}
-	return ctx.instances, nil
-}
-
-func (d *iDirectInputDevice8W) setButtonDataFormat(buttons []uint8) error {
-	formats := make([]diObjectDataFormat, len(buttons))
-	for offset, button := range buttons {
-		formats[offset] = diObjectDataFormat{
-			guid:       &guidButton,
-			offset:     uint32(offset),
-			objectType: didftButton | uint32(button)<<8,
+	instances := make([]int, 0, len(ctx.objects))
+	for _, object := range ctx.objects {
+		instance := int((object.objectType >> 8) & 0xffff)
+		if instance < maxButtons {
+			instances = append(instances, instance)
 		}
 	}
+	return instances, nil
+}
+
+func (d *iDirectInputDevice8W) enumAxes() ([]diDeviceObjectInstanceW, error) {
+	ctx := &objectEnumContext{}
+	reference, unregister := registerCallbackValue(ctx)
+	defer unregister()
+	hr, _, _ := syscall.SyscallN(
+		d.vtable.enumObjects,
+		uintptr(unsafe.Pointer(d)),
+		enumObjectsProc,
+		reference,
+		didftAxis,
+	)
+	runtime.KeepAlive(d)
+	if hresultFailed(uint32(hr)) {
+		return nil, newDirectInputError("IDirectInputDevice8.EnumObjects(axes)", uint32(hr))
+	}
+	return ctx.objects, nil
+}
+
+func (d *iDirectInputDevice8W) setInputDataFormat(axes []runtimeAxis, buttons []uint8) (int, error) {
+	formats := make([]diObjectDataFormat, 0, len(axes)+len(buttons))
+	for index := range axes {
+		axis := &axes[index]
+		formats = append(formats, diObjectDataFormat{
+			guid:       &axis.guid,
+			offset:     uint32(index * 4),
+			objectType: axis.objectType,
+		})
+	}
+	buttonStart := len(axes) * 4
+	for offset, button := range buttons {
+		formats = append(formats, diObjectDataFormat{
+			guid:       &guidButton,
+			offset:     uint32(buttonStart + offset),
+			objectType: didftButton | uint32(button)<<8,
+		})
+	}
+	dataSize := buttonStart + len(buttons)
 	format := diDataFormat{
 		size:        uint32(unsafe.Sizeof(diDataFormat{})),
 		objectSize:  uint32(unsafe.Sizeof(diObjectDataFormat{})),
-		dataSize:    uint32(len(formats)),
+		flags:       didfAbsAxis,
+		dataSize:    uint32(dataSize),
 		objectCount: uint32(len(formats)),
 		objects:     &formats[0],
 	}
@@ -761,7 +936,32 @@ func (d *iDirectInputDevice8W) setButtonDataFormat(buttons []uint8) error {
 	runtime.KeepAlive(d)
 	runtime.KeepAlive(formats)
 	if hresultFailed(uint32(hr)) {
-		return newDirectInputError("IDirectInputDevice8.SetDataFormat", uint32(hr))
+		return 0, newDirectInputError("IDirectInputDevice8.SetDataFormat", uint32(hr))
+	}
+	return dataSize, nil
+}
+
+func (d *iDirectInputDevice8W) setAxisRange(objectType uint32, minimum, maximum int32) error {
+	property := diPropRange{
+		header: diPropHeader{
+			size:       uint32(unsafe.Sizeof(diPropRange{})),
+			headerSize: uint32(unsafe.Sizeof(diPropHeader{})),
+			object:     objectType,
+			how:        diphByID,
+		},
+		minimum: minimum,
+		maximum: maximum,
+	}
+	hr, _, _ := syscall.SyscallN(
+		d.vtable.setProperty,
+		uintptr(unsafe.Pointer(d)),
+		dipropRange,
+		uintptr(unsafe.Pointer(&property)),
+	)
+	runtime.KeepAlive(d)
+	runtime.KeepAlive(property)
+	if hresultFailed(uint32(hr)) {
+		return newDirectInputError("IDirectInputDevice8.SetProperty(DIPROP_RANGE)", uint32(hr))
 	}
 	return nil
 }

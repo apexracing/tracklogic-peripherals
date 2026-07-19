@@ -11,11 +11,16 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-type recordingSink struct{ events []ButtonEvent }
+type recordingSink struct {
+	events     []ButtonEvent
+	axisEvents []AxisEvent
+}
 
-func (s *recordingSink) setDevices([]DeviceInfo) {}
-func (s *recordingSink) report(error)            {}
-func (s *recordingSink) emit(event ButtonEvent)  { s.events = append(s.events, event) }
+func (s *recordingSink) setDevices([]DeviceInfo)      {}
+func (s *recordingSink) syncAxis(AxisEvent)           {}
+func (s *recordingSink) report(error)                 {}
+func (s *recordingSink) emitButton(event ButtonEvent) { s.events = append(s.events, event) }
+func (s *recordingSink) emitAxis(event AxisEvent)     { s.axisEvents = append(s.axisEvents, event) }
 
 func TestDirectInputABISizesAMD64(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
@@ -29,6 +34,7 @@ func TestDirectInputABISizesAMD64(t *testing.T) {
 		"DIOBJECTDATAFORMAT":      {unsafe.Sizeof(diObjectDataFormat{}), 24},
 		"DIDATAFORMAT":            {unsafe.Sizeof(diDataFormat{}), 32},
 		"DIPROPDWORD":             {unsafe.Sizeof(diPropDWORD{}), 20},
+		"DIPROPRANGE":             {unsafe.Sizeof(diPropRange{}), 24},
 		"DIDEVICEOBJECTDATA":      {unsafe.Sizeof(diDeviceObjectData{}), 24},
 	}
 	for name, test := range cases {
@@ -41,14 +47,31 @@ func TestDirectInputABISizesAMD64(t *testing.T) {
 func TestRuntimeDeviceEdgesAndDisconnectRelease(t *testing.T) {
 	sink := &recordingSink{}
 	device := &runtimeDevice{info: DeviceInfo{InstanceGUID: "wheel"}}
-	device.emitIfChanged(sink, 3, true)
-	device.emitIfChanged(sink, 3, true)
+	device.emitButtonIfChanged(sink, 3, true)
+	device.emitButtonIfChanged(sink, 3, true)
 	device.release(sink, true)
 	if len(sink.events) != 2 {
 		t.Fatalf("got %d events, want press and synthetic release", len(sink.events))
 	}
 	if sink.events[0].State != Pressed || sink.events[1].State != Released {
 		t.Fatalf("unexpected events: %+v", sink.events)
+	}
+}
+
+func TestRuntimeDeviceAxisSamplesAreNormalizedAndDeduplicated(t *testing.T) {
+	sink := &recordingSink{}
+	device := &runtimeDevice{
+		info: DeviceInfo{InstanceGUID: "pedals"},
+		axes: []runtimeAxis{{instance: 7, name: "Brake"}},
+	}
+	device.emitAxisIfChanged(sink, 0, axisRawMaximum/2)
+	device.emitAxisIfChanged(sink, 0, axisRawMaximum/2)
+	if len(sink.axisEvents) != 1 {
+		t.Fatalf("got %d axis events, want one", len(sink.axisEvents))
+	}
+	event := sink.axisEvents[0]
+	if event.Axis != 7 || event.AxisName != "Brake" || event.Value < 0.499 || event.Value > 0.501 {
+		t.Fatalf("unexpected axis event: %+v", event)
 	}
 }
 

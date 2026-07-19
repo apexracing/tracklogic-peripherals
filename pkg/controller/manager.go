@@ -17,7 +17,9 @@ type inputBackend interface {
 
 type backendSink interface {
 	setDevices([]DeviceInfo)
-	emit(ButtonEvent)
+	syncAxis(AxisEvent)
+	emitButton(ButtonEvent)
+	emitAxis(AxisEvent)
 	report(error)
 }
 
@@ -25,36 +27,53 @@ type captureRequest struct {
 	result chan Binding
 }
 
-// Manager owns DirectInput discovery, acquisition, and button event delivery.
+type axisKey struct {
+	device string
+	axis   uint16
+}
+
+type axisCaptureRequest struct {
+	result    chan AxisBinding
+	baselines map[axisKey]float64
+}
+
+// Manager owns DirectInput discovery, acquisition, and button/axis delivery.
 // A Manager may be started only once.
 type Manager struct {
 	options   managerOptions
 	backend   inputBackend
 	optionErr error
 
-	mu      sync.RWMutex
-	started bool
-	closed  bool
-	devices []DeviceInfo
-	cancel  context.CancelFunc
-	capture *captureRequest
+	mu                sync.RWMutex
+	started           bool
+	closed            bool
+	devices           []DeviceInfo
+	cancel            context.CancelFunc
+	capture           *captureRequest
+	axisCapture       *axisCaptureRequest
+	axisValues        map[axisKey]float64
+	axisEventsEnabled bool
 
-	events chan ButtonEvent
-	errors chan error
-	done   chan struct{}
-	wg     sync.WaitGroup
+	events     chan ButtonEvent
+	axisEvents chan AxisEvent
+	errors     chan error
+	done       chan struct{}
+	wg         sync.WaitGroup
 
 	finishOnce sync.Once
 }
 
-// NewManager constructs a DirectInput button manager. Option validation errors
+// NewManager constructs a DirectInput input manager. Option validation errors
 // are reported by Start so construction remains convenient for service fields.
 func NewManager(options ...Option) *Manager {
 	m := &Manager{
-		backend: newDirectInputBackend(),
-		events:  make(chan ButtonEvent, eventBufferSize),
-		errors:  make(chan error, errorBufferSize),
-		done:    make(chan struct{}),
+		backend:    newDirectInputBackend(),
+		options:    managerOptions{axisCaptureThreshold: defaultAxisCaptureThreshold},
+		events:     make(chan ButtonEvent, eventBufferSize),
+		axisEvents: make(chan AxisEvent, eventBufferSize),
+		errors:     make(chan error, errorBufferSize),
+		done:       make(chan struct{}),
+		axisValues: make(map[axisKey]float64),
 	}
 	for _, option := range options {
 		if option == nil {
@@ -136,13 +155,21 @@ func (m *Manager) Start(ctx context.Context) error {
 func (m *Manager) Devices() []DeviceInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	out := make([]DeviceInfo, len(m.devices))
-	copy(out, m.devices)
-	return out
+	return cloneDeviceInfos(m.devices)
 }
 
 // Events returns the manager's button edge stream.
 func (m *Manager) Events() <-chan ButtonEvent { return m.events }
+
+// AxisEvents returns the manager's normalized absolute-axis sample stream.
+// Callers that request this stream must drain it continuously. Axis collection
+// and CaptureAxis work even when AxisEvents is never called.
+func (m *Manager) AxisEvents() <-chan AxisEvent {
+	m.mu.Lock()
+	m.axisEventsEnabled = true
+	m.mu.Unlock()
+	return m.axisEvents
+}
 
 // Errors returns non-fatal discovery errors and terminal runtime errors. Start
 // returns initialization errors directly.
@@ -165,7 +192,7 @@ func (m *Manager) Capture(ctx context.Context) (Binding, error) {
 		m.mu.Unlock()
 		return Binding{}, ErrNotStarted
 	}
-	if m.capture != nil {
+	if m.capture != nil || m.axisCapture != nil {
 		m.mu.Unlock()
 		return Binding{}, ErrCaptureInProgress
 	}
@@ -187,6 +214,52 @@ func (m *Manager) Capture(ctx context.Context) (Binding, error) {
 		return Binding{}, ctx.Err()
 	case <-m.done:
 		return Binding{}, ErrClosed
+	}
+}
+
+// CaptureAxis waits until an absolute axis moves by the configured threshold
+// from its position when capture begins. It does not consume AxisEvents.
+func (m *Manager) CaptureAxis(ctx context.Context) (AxisBinding, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req := &axisCaptureRequest{result: make(chan AxisBinding, 1)}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return AxisBinding{}, ErrClosed
+	}
+	if !m.started {
+		m.mu.Unlock()
+		return AxisBinding{}, ErrNotStarted
+	}
+	if m.capture != nil || m.axisCapture != nil {
+		m.mu.Unlock()
+		return AxisBinding{}, ErrCaptureInProgress
+	}
+	req.baselines = make(map[axisKey]float64, len(m.axisValues))
+	for key, value := range m.axisValues {
+		req.baselines[key] = value
+	}
+	m.axisCapture = req
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		if m.axisCapture == req {
+			m.axisCapture = nil
+		}
+		m.mu.Unlock()
+	}()
+
+	select {
+	case binding := <-req.result:
+		return binding, nil
+	case <-ctx.Done():
+		return AxisBinding{}, ctx.Err()
+	case <-m.done:
+		return AxisBinding{}, ErrClosed
 	}
 }
 
@@ -215,14 +288,37 @@ func (m *Manager) Close() error {
 }
 
 func (m *Manager) setDevices(devices []DeviceInfo) {
-	snapshot := make([]DeviceInfo, len(devices))
-	copy(snapshot, devices)
+	snapshot := cloneDeviceInfos(devices)
 	m.mu.Lock()
 	m.devices = snapshot
+	present := make(map[string]bool, len(snapshot))
+	for _, device := range snapshot {
+		present[device.InstanceGUID] = true
+	}
+	for key := range m.axisValues {
+		if !present[key.device] {
+			delete(m.axisValues, key)
+		}
+	}
 	m.mu.Unlock()
 }
 
-func (m *Manager) emit(event ButtonEvent) {
+func cloneDeviceInfos(devices []DeviceInfo) []DeviceInfo {
+	snapshot := make([]DeviceInfo, len(devices))
+	copy(snapshot, devices)
+	return snapshot
+}
+
+func (m *Manager) syncAxis(event AxisEvent) {
+	if event.Device.InstanceGUID == "" || event.Value < 0 || event.Value > 1 {
+		return
+	}
+	m.mu.Lock()
+	m.axisValues[axisKey{device: event.Device.InstanceGUID, axis: event.Axis}] = event.Value
+	m.mu.Unlock()
+}
+
+func (m *Manager) emitButton(event ButtonEvent) {
 	if event.Button >= maxButtons {
 		return
 	}
@@ -248,6 +344,58 @@ func (m *Manager) emit(event ButtonEvent) {
 	}
 }
 
+func (m *Manager) emitAxis(event AxisEvent) {
+	if event.Device.InstanceGUID == "" || event.Value < 0 || event.Value > 1 {
+		return
+	}
+
+	key := axisKey{device: event.Device.InstanceGUID, axis: event.Axis}
+	m.mu.Lock()
+	m.axisValues[key] = event.Value
+	if capture := m.axisCapture; capture != nil {
+		baseline, ok := capture.baselines[key]
+		if !ok {
+			capture.baselines[key] = event.Value
+		} else {
+			delta := event.Value - baseline
+			absoluteDelta := delta
+			if absoluteDelta < 0 {
+				absoluteDelta = -absoluteDelta
+			}
+			direction := AxisIncreasing
+			if delta < 0 {
+				direction = AxisDecreasing
+			}
+			if absoluteDelta >= minimumAxisCaptureMovement &&
+				normalizedAxisTravel(baseline, event.Value, direction) >= m.options.axisCaptureThreshold {
+				binding := AxisBinding{
+					DeviceInstanceGUID: event.Device.InstanceGUID,
+					Axis:               event.Axis,
+					AxisName:           event.AxisName,
+					Direction:          direction,
+					Baseline:           baseline,
+				}
+				select {
+				case capture.result <- binding:
+					m.axisCapture = nil
+				default:
+				}
+			}
+		}
+	}
+	enabled := m.axisEventsEnabled
+	m.mu.Unlock()
+
+	if !enabled {
+		return
+	}
+	select {
+	case m.axisEvents <- event:
+	default:
+		m.report(ErrAxisEventBufferFull)
+	}
+}
+
 func (m *Manager) report(err error) {
 	if err == nil {
 		return
@@ -265,9 +413,11 @@ func (m *Manager) finish() {
 		m.mu.Lock()
 		m.closed = true
 		m.capture = nil
+		m.axisCapture = nil
 		m.mu.Unlock()
 		close(m.done)
 		close(m.events)
+		close(m.axisEvents)
 		close(m.errors)
 	})
 }
