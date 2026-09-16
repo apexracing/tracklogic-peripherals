@@ -4,6 +4,19 @@
 
 ## [未发布]
 
+## [1.2.0] - 2026-09-16
+
+### 新增
+
+- `controller.WithPollInterval`：可配置 DirectInput 输入采样间隔，最小 1ms，默认保持 5ms。
+- `controller.WithDeviceRescanInterval` 和 `WithDeviceRescanAllowed`：可关闭自动设备扫描，或在训练等延迟敏感阶段延后扫描；默认扫描间隔仍为 2 秒。
+- `controller.DeviceInfo.VendorID` / `ProductID`：公开设备产品 GUID 中的 VID/PID 标识，便于调用方区分同名设备型号。
+
+### 修复
+
+- DirectInput 启动稳定化采样使用配置后的轮询间隔，避免采样与设备初始化使用不同节奏。
+- 将训练项目中的输入采集补丁归回模块，调用方可直接依赖正式 tag，无需本地源码替换。
+
 ## [1.1.0] - 2026-07-19
 
 ### 新增

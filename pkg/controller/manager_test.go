@@ -11,6 +11,7 @@ import (
 type fakeBackend struct {
 	mu      sync.Mutex
 	sink    backendSink
+	options managerOptions
 	started chan struct{}
 	ready   error
 	runErr  error
@@ -20,9 +21,10 @@ func newFakeBackend() *fakeBackend {
 	return &fakeBackend{started: make(chan struct{})}
 }
 
-func (b *fakeBackend) run(ctx context.Context, _ uintptr, ready chan<- error, sink backendSink) error {
+func (b *fakeBackend) run(ctx context.Context, options managerOptions, ready chan<- error, sink backendSink) error {
 	b.mu.Lock()
 	b.sink = sink
+	b.options = options
 	close(b.started)
 	b.mu.Unlock()
 	ready <- b.ready
@@ -31,6 +33,51 @@ func (b *fakeBackend) run(ctx context.Context, _ uintptr, ready chan<- error, si
 	}
 	<-ctx.Done()
 	return b.runErr
+}
+
+func TestManagerPassesInputTimingOptionsToBackend(t *testing.T) {
+	backend := newFakeBackend()
+	manager := newManagerWithBackend(
+		backend,
+		WithPollInterval(time.Second/60),
+		WithDeviceRescanInterval(0),
+	)
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	backend.mu.Lock()
+	options := backend.options
+	backend.mu.Unlock()
+	if options.pollInterval != time.Second/60 {
+		t.Fatalf("poll interval = %s, want %s", options.pollInterval, time.Second/60)
+	}
+	if options.deviceRescanInterval != 0 {
+		t.Fatalf("device rescan interval = %s, want disabled", options.deviceRescanInterval)
+	}
+}
+
+func TestManagerPassesDynamicDiscoveryGate(t *testing.T) {
+	backend := newFakeBackend()
+	allowed := false
+	manager := newManagerWithBackend(backend, WithDeviceRescanInterval(2*time.Second), WithDeviceRescanAllowed(func() bool { return allowed }))
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	backend.mu.Lock()
+	options := backend.options
+	backend.mu.Unlock()
+	if options.deviceRescanInterval != 2*time.Second || options.deviceRescanAllowed == nil {
+		t.Fatal("missing discovery schedule")
+	}
+	if options.deviceRescanAllowed() {
+		t.Fatal("gate ignored")
+	}
+	allowed = true
+	if !options.deviceRescanAllowed() {
+		t.Fatal("scan did not resume after pause")
+	}
 }
 
 func (b *fakeBackend) emit(event ButtonEvent) {

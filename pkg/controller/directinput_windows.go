@@ -41,8 +41,6 @@ const (
 
 	gaRoot = 2
 
-	pollInterval   = 5 * time.Millisecond
-	rescanInterval = 2 * time.Second
 	deviceBuffer   = 256
 	axisRawMaximum = 65535
 )
@@ -78,14 +76,14 @@ func newDirectInputBackend() inputBackend { return &directInputBackend{} }
 
 func (b *directInputBackend) run(
 	ctx context.Context,
-	externalWindow uintptr,
+	options managerOptions,
 	ready chan<- error,
 	sink backendSink,
 ) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	window, ownsWindow, err := cooperativeWindow(externalWindow)
+	window, ownsWindow, err := cooperativeWindow(options.windowHandle)
 	if err != nil {
 		ready <- err
 		return nil
@@ -100,9 +98,10 @@ func (b *directInputBackend) run(
 		return nil
 	}
 	runtimeState := &directInputRuntime{
-		di:      di,
-		window:  window,
-		devices: make(map[string]*runtimeDevice),
+		di:           di,
+		window:       window,
+		pollInterval: options.pollInterval,
+		devices:      make(map[string]*runtimeDevice),
 	}
 	defer func() {
 		runtimeState.releaseAll(sink, true)
@@ -115,10 +114,15 @@ func (b *directInputBackend) run(
 	}
 	ready <- nil
 
-	pollTicker := time.NewTicker(pollInterval)
+	pollTicker := time.NewTicker(options.pollInterval)
 	defer pollTicker.Stop()
-	rescanTicker := time.NewTicker(rescanInterval)
-	defer rescanTicker.Stop()
+	var rescanTicker *time.Ticker
+	var rescanC <-chan time.Time
+	if options.deviceRescanInterval > 0 {
+		rescanTicker = time.NewTicker(options.deviceRescanInterval)
+		rescanC = rescanTicker.C
+		defer rescanTicker.Stop()
+	}
 
 	for {
 		select {
@@ -126,9 +130,12 @@ func (b *directInputBackend) run(
 			return nil
 		case <-pollTicker.C:
 			runtimeState.poll(sink)
-		case <-rescanTicker.C:
-			if externalWindow != 0 {
-				if err := validateCooperativeWindow(externalWindow); err != nil {
+		case <-rescanC:
+			if options.deviceRescanAllowed != nil && !options.deviceRescanAllowed() {
+				continue
+			}
+			if options.windowHandle != 0 {
+				if err := validateCooperativeWindow(options.windowHandle); err != nil {
 					return err
 				}
 			}
@@ -140,9 +147,10 @@ func (b *directInputBackend) run(
 }
 
 type directInputRuntime struct {
-	di      *iDirectInput8W
-	window  windows.HWND
-	devices map[string]*runtimeDevice
+	di           *iDirectInput8W
+	window       windows.HWND
+	pollInterval time.Duration
+	devices      map[string]*runtimeDevice
 }
 
 type runtimeDevice struct {
@@ -294,7 +302,7 @@ func (r *directInputRuntime) initializeDevice(target *runtimeDevice, sink backen
 	// one polling interval. Refresh once more before Start reports readiness so
 	// CaptureAxis cannot bind the transition from the default center position.
 	for range 2 {
-		time.Sleep(pollInterval)
+		time.Sleep(r.pollInterval)
 		if hr := target.device.poll(); hresultFailed(hr) {
 			return nil
 		}
@@ -321,14 +329,29 @@ func (r *directInputRuntime) releaseAll(sink backendSink, emitReleased bool) {
 }
 
 func (d *runtimeDevice) refreshInfo() {
+	vendorID, productID := directInputUSBIDs(d.descriptor.guidProduct)
 	d.info = DeviceInfo{
 		InstanceGUID: d.descriptor.guidInstance.String(),
 		ProductGUID:  d.descriptor.guidProduct.String(),
 		InstanceName: windows.UTF16ToString(d.descriptor.instanceName[:]),
 		ProductName:  windows.UTF16ToString(d.descriptor.productName[:]),
+		VendorID:     vendorID,
+		ProductID:    productID,
 		ButtonCount:  len(d.buttons),
 		AxisCount:    len(d.axes),
 	}
+}
+
+// directInputUSBIDs decodes the VID/PID convention used by USB-backed
+// DirectInput product GUIDs. Windows stores the PID in the high 16 bits and
+// the VID in the low 16 bits of Data1, e.g. {05013670-...} is VID 0x3670,
+// PID 0x0501. A non-USB or synthetic DirectInput device may use another GUID
+// layout; callers receive zeroes in that case and must fall back to its name.
+func directInputUSBIDs(product windows.GUID) (vendorID, productID uint16) {
+	if product.Data1 == 0 {
+		return 0, 0
+	}
+	return uint16(product.Data1 & 0xffff), uint16(product.Data1 >> 16)
 }
 
 func (d *runtimeDevice) poll(sink backendSink) {

@@ -75,6 +75,16 @@ func TestRuntimeDeviceAxisSamplesAreNormalizedAndDeduplicated(t *testing.T) {
 	}
 }
 
+func TestDirectInputProductGUIDDecodesUSBVIDPID(t *testing.T) {
+	vendorID, productID := directInputUSBIDs(windows.GUID{Data1: 0x05013670})
+	if vendorID != 0x3670 || productID != 0x0501 {
+		t.Fatalf("decoded VID/PID = %04x/%04x, want 3670/0501", vendorID, productID)
+	}
+	if vendorID, productID := directInputUSBIDs(windows.GUID{}); vendorID != 0 || productID != 0 {
+		t.Fatalf("zero product GUID decoded VID/PID = %04x/%04x", vendorID, productID)
+	}
+}
+
 func TestHiddenCooperativeWindowLifecycle(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

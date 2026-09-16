@@ -239,6 +239,8 @@ var ErrUnsupported = ...
 
 `pkg/controller` 的输入 API 由 `DeviceInfo`、`ButtonEvent`、`Binding`、`AxisEvent`、`AxisBinding`、`AxisDirection` 和 `Manager` 组成；详见上面的 DirectInput 示例及 Go 文档。
 
+v1.2.0 支持 `WithPollInterval`（默认 5ms，最小 1ms）、`WithDeviceRescanInterval`（默认 2 秒，0 表示关闭自动扫描）和 `WithDeviceRescanAllowed`（扫描前检查的快速、并发安全回调）。这些选项只控制底层输入采样和设备枚举，不限制调用方自己的 UI 刷新频率。`DeviceInfo` 同时提供产品 GUID 中的 `VendorID` / `ProductID`，可用于区分同名设备。
+
 ## 架构
 
 ```mermaid

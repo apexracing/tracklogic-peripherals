@@ -14,6 +14,9 @@ const (
 	maxAxes                     = 32
 	defaultAxisCaptureThreshold = 0.95
 	minimumAxisCaptureMovement  = 0.20
+	defaultPollInterval         = 5 * time.Millisecond
+	defaultDeviceRescanInterval = 2 * time.Second
+	minimumPollInterval         = time.Millisecond
 )
 
 var (
@@ -42,8 +45,14 @@ type DeviceInfo struct {
 	ProductGUID  string `json:"productGuid"`
 	InstanceName string `json:"instanceName"`
 	ProductName  string `json:"productName"`
-	ButtonCount  int    `json:"buttonCount"`
-	AxisCount    int    `json:"axisCount"`
+	// VendorID and ProductID are decoded from the DirectInput product GUID
+	// when the device exposes the usual USB-backed identifier. They are kept
+	// alongside the friendly name so callers can disambiguate models that share
+	// the same Windows product string (for example Simagic Alpha EVO variants).
+	VendorID    uint16 `json:"vendorId,omitempty"`
+	ProductID   uint16 `json:"productId,omitempty"`
+	ButtonCount int    `json:"buttonCount"`
+	AxisCount   int    `json:"axisCount"`
 }
 
 // ButtonState is the edge state carried by a ButtonEvent.
@@ -178,6 +187,9 @@ type Option func(*managerOptions) error
 type managerOptions struct {
 	windowHandle         uintptr
 	axisCaptureThreshold float64
+	pollInterval         time.Duration
+	deviceRescanInterval time.Duration
+	deviceRescanAllowed  func() bool
 }
 
 // WithWindowHandle associates DirectInput with a caller-owned top-level HWND.
@@ -190,6 +202,41 @@ func WithWindowHandle(hwnd uintptr) Option {
 			return fmt.Errorf("%w: handle is zero", ErrWindowUnavailable)
 		}
 		options.windowHandle = hwnd
+		return nil
+	}
+}
+
+// WithPollInterval sets the DirectInput acquisition cadence. It controls
+// physical input sampling only; callers can independently choose a lower UI
+// publication rate.
+func WithPollInterval(interval time.Duration) Option {
+	return func(options *managerOptions) error {
+		if interval < minimumPollInterval {
+			return fmt.Errorf("controller: poll interval must be at least %s", minimumPollInterval)
+		}
+		options.pollInterval = interval
+		return nil
+	}
+}
+
+// WithDeviceRescanInterval controls background device enumeration. A zero
+// interval disables automatic rescans so active input acquisition is never
+// interrupted by a periodic DirectInput enumeration.
+func WithDeviceRescanInterval(interval time.Duration) Option {
+	return func(options *managerOptions) error {
+		if interval < 0 {
+			return errors.New("controller: device rescan interval cannot be negative")
+		}
+		options.deviceRescanInterval = interval
+		return nil
+	}
+}
+
+// WithDeviceRescanAllowed defers a scheduled scan while latency-sensitive
+// driving is active. The predicate must be quick and concurrency-safe.
+func WithDeviceRescanAllowed(allowed func() bool) Option {
+	return func(options *managerOptions) error {
+		options.deviceRescanAllowed = allowed
 		return nil
 	}
 }

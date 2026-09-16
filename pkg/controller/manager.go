@@ -12,7 +12,7 @@ const (
 )
 
 type inputBackend interface {
-	run(context.Context, uintptr, chan<- error, backendSink) error
+	run(context.Context, managerOptions, chan<- error, backendSink) error
 }
 
 type backendSink interface {
@@ -67,8 +67,12 @@ type Manager struct {
 // are reported by Start so construction remains convenient for service fields.
 func NewManager(options ...Option) *Manager {
 	m := &Manager{
-		backend:    newDirectInputBackend(),
-		options:    managerOptions{axisCaptureThreshold: defaultAxisCaptureThreshold},
+		backend: newDirectInputBackend(),
+		options: managerOptions{
+			axisCaptureThreshold: defaultAxisCaptureThreshold,
+			pollInterval:         defaultPollInterval,
+			deviceRescanInterval: defaultDeviceRescanInterval,
+		},
 		events:     make(chan ButtonEvent, eventBufferSize),
 		axisEvents: make(chan AxisEvent, eventBufferSize),
 		errors:     make(chan error, errorBufferSize),
@@ -128,7 +132,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		err := m.backend.run(runCtx, m.options.windowHandle, ready, m)
+		err := m.backend.run(runCtx, m.options, ready, m)
 		if err != nil {
 			m.report(err)
 		}
