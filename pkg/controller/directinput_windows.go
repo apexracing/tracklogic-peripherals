@@ -425,6 +425,15 @@ func (d *runtimeDevice) reconcile(sink backendSink, emit bool) error {
 	if hresultFailed(hr) {
 		return newDirectInputError("IDirectInputDevice8.GetDeviceState", hr)
 	}
+	return d.applyInputState(state, sink, emit)
+}
+
+func (d *runtimeDevice) applyInputState(state []byte, sink backendSink, emit bool) error {
+	buttonStart := len(d.axes) * 4
+	required := buttonStart + len(d.buttons)
+	if len(state) < required {
+		return fmt.Errorf("controller: short input state: got %d bytes, need %d (axes=%d buttons=%d)", len(state), required, len(d.axes), len(d.buttons))
+	}
 	for index := range d.axes {
 		raw := binary.LittleEndian.Uint32(state[index*4 : index*4+4])
 		if emit {
@@ -437,8 +446,9 @@ func (d *runtimeDevice) reconcile(sink backendSink, emit bool) error {
 			}
 		}
 	}
-	buttonStart := len(d.axes) * 4
-	for offset, value := range state[buttonStart:] {
+	// The DirectInput packet is DWORD-aligned. Its trailing padding is not
+	// button data and must not be indexed into d.buttons or emitted as input.
+	for offset, value := range state[buttonStart:required] {
 		button := d.buttons[offset]
 		down := value&0x80 != 0
 		if emit {
@@ -924,7 +934,7 @@ func (d *iDirectInputDevice8W) enumAxes() ([]diDeviceObjectInstanceW, error) {
 	return ctx.objects, nil
 }
 
-func (d *iDirectInputDevice8W) setInputDataFormat(axes []runtimeAxis, buttons []uint8) (int, error) {
+func buildInputDataFormat(axes []runtimeAxis, buttons []uint8) (diDataFormat, []diObjectDataFormat) {
 	formats := make([]diObjectDataFormat, 0, len(axes)+len(buttons))
 	for index := range axes {
 		axis := &axes[index]
@@ -942,14 +952,26 @@ func (d *iDirectInputDevice8W) setInputDataFormat(axes []runtimeAxis, buttons []
 			objectType: didftButton | uint32(button)<<8,
 		})
 	}
-	dataSize := buttonStart + len(buttons)
+	// DIDATAFORMAT.dwDataSize must be a multiple of four, including devices
+	// whose button count is not DWORD-aligned. Object offsets do not change.
+	dataSize := (buttonStart + len(buttons) + 3) &^ 3
 	format := diDataFormat{
 		size:        uint32(unsafe.Sizeof(diDataFormat{})),
 		objectSize:  uint32(unsafe.Sizeof(diObjectDataFormat{})),
 		flags:       didfAbsAxis,
 		dataSize:    uint32(dataSize),
 		objectCount: uint32(len(formats)),
-		objects:     &formats[0],
+	}
+	if len(formats) > 0 {
+		format.objects = &formats[0]
+	}
+	return format, formats
+}
+
+func (d *iDirectInputDevice8W) setInputDataFormat(axes []runtimeAxis, buttons []uint8) (int, error) {
+	format, formats := buildInputDataFormat(axes, buttons)
+	if len(formats) == 0 {
+		return 0, nil
 	}
 	hr, _, _ := syscall.SyscallN(
 		d.vtable.setDataFormat,
@@ -958,10 +980,17 @@ func (d *iDirectInputDevice8W) setInputDataFormat(axes []runtimeAxis, buttons []
 	)
 	runtime.KeepAlive(d)
 	runtime.KeepAlive(formats)
+	runtime.KeepAlive(axes)
 	if hresultFailed(uint32(hr)) {
-		return 0, newDirectInputError("IDirectInputDevice8.SetDataFormat", uint32(hr))
+		axisTypes := make([]string, len(axes))
+		for index, axis := range axes {
+			axisTypes[index] = fmt.Sprintf("0x%08X", axis.objectType)
+		}
+		return 0, fmt.Errorf("%w (axes=%d buttons=%d raw_size=%d data_size=%d axis_types=%v)",
+			newDirectInputError("IDirectInputDevice8.SetDataFormat", uint32(hr)),
+			len(axes), len(buttons), len(axes)*4+len(buttons), format.dataSize, axisTypes)
 	}
-	return dataSize, nil
+	return int(format.dataSize), nil
 }
 
 func (d *iDirectInputDevice8W) setAxisRange(objectType uint32, minimum, maximum int32) error {
