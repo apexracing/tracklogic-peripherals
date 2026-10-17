@@ -2,7 +2,7 @@
 
 赛车模拟器外设的 Go 驱动库。
 
-仓库包含两类相互独立的能力：`pkg/hpr` 负责厂家相关的踏板振动输出，`pkg/controller` 通过 Windows DirectInput 提供厂家无关的游戏控制器数字按钮与模拟轴输入。
+仓库包含三类相互独立的能力：`pkg/hpr` 负责踏板振动输出，`pkg/controller` 通过 DirectInput 提供游戏控制器数字按钮与模拟轴输入，`pkg/input` 为 VR 提供统一的键盘、控制器按钮和方向帽绑定，以及编辑时的键盘拦截。
 
 振动调用方构造 `hpr.Manager`，注册一个或多个厂家驱动，调 `Scan` 拿到当前可用的设备列表，再对每个 `ScannedDevice` 调 `Open` 拿一个 `hpr.Device` 来发振动命令。厂家驱动作为 `pkg/hpr/driver/<vendor>/` 子包存在，是调用方和真实硬件之间的薄薄一层。
 
@@ -153,6 +153,65 @@ go func() {
 ```
 
 `AxisEvent.Value` 是 `0..1` 归一化绝对位置。`AxisBinding` 保存设备 Instance GUID、轴实例、显示名称、捕获基线和移动方向；`Travel` 会处理正向、反向以及静止点在中间的半轴踏板，并把基线到对应端点重新归一化为 `0..1`。`CaptureAxis` 默认只在轴达到 95% 行程且绝对变化至少为 20% 时完成，避免端点附近的微小残余变化被误判为满行程；可用 `WithAxisCaptureThreshold` 修改方向行程阈值。调用 `AxisEvents()` 后必须持续读取该通道。
+
+## VR 统一输入
+
+`input.Manager` 在进程内的一条 `goroutine + runtime.LockOSThread()` 线程运行。
+控制器使用 Windows 自带的 `Windows.Gaming.Input.RawGameController`，键盘使用 Windows 原生监听。
+无需辅助进程、cgo、额外 DLL 或 Microsoft GameInput SDK，不按厂家或型号筛选设备。
+接口接收完整的按钮编号与方向帽方向，模拟轴不参与快捷键录入，也不产生设备输出或力反馈。
+
+仅在 VR 启用或设置页录入 VR 绑定时启动；两者都结束后关闭。现有 AI、踏板和 HPR/FFB 调用不需要迁移。
+
+```go
+import (
+    "context"
+    "github.com/apexracing/tracklogic-peripherals/pkg/input"
+)
+
+vrInput := input.NewManager()
+events, unsubscribe := vrInput.Subscribe()
+defer unsubscribe()
+if err := vrInput.Start(context.Background()); err != nil {
+    return err
+}
+defer vrInput.Close()
+
+// 绑定录入只有在主键及修饰键全部松开、或方向帽回中后才完成。
+// 支持 context 超时/取消；Escape 取消。保存绑定由应用负责。
+binding, err := vrInput.Capture(recordingContext)
+if err != nil {
+    return err
+}
+
+// events 是独立订阅，录入和动作监听不会互相抢走事件。
+// 首次读到的按住状态只作为基线，不产生新的按下动作。
+for event := range events {
+    if event.Type == "input" && event.Pressed && event.Binding.Identity() == binding.Identity() {
+        // 按 VR 当前状态执行动作。
+    }
+    if event.Type == "reset" {
+        // 取消持续移动，等待新的按下；不要回放积压动作。
+    }
+}
+```
+
+进入 VR 布局编辑时设置拦截范围，退出时传入空策略。只有目标进程处于前台时才拦截准确匹配的键盘组合；进入编辑前已按住的键不会被中途接管。回正键放入 `PassThrough`，优先级高于拦截列表；控制器始终透传给游戏。
+
+```go
+err := vrInput.SetKeyboardPolicy(input.KeyboardPolicy{
+    TargetProcessID: gameProcessID,
+    Block: []input.KeyChord{{Code: 'A'}, {Code: 'F'}, {Code: 37}, {Code: 39}},
+    PassThrough: []input.KeyChord{{Code: 186}}, // ;，与游戏共享的回正键
+})
+// 退出编辑：vrInput.SetKeyboardPolicy(input.KeyboardPolicy{})
+```
+
+控制器 ID 使用 `wgi:` 前缀加系统 `NonRoamableId` 的摘要，不会把旧 DirectInput GUID 或 GameInput ID 猜测成新 ID。该 ID 由应用、电脑及 USB 端口共同限定，测试器绑定不能复制到 TrackLogic 使用；同一应用与端口可跨重启保留。[微软身份说明](https://learn.microsoft.com/en-us/uwp/api/windows.gaming.input.rawgamecontroller.nonroamableid)。更换设备或系统身份变化时，应让用户重新录入。方向帽若由驱动报告为普通按钮，就按普通按钮处理。
+
+可视化验证：`go run ./examples/input-tester`。窗口展示按钮、方向帽、键盘实时状态、绑定结果和编辑拦截计数。仅需一个生成的 EXE。
+
+自动测试：`go test -race ./pkg/input ./pkg/controller`。本机原生生命周期测试需设置 `TRACKLOGIC_INPUT_NATIVE_TEST=1`；仅向自有前台窗口发送测试键的集成测试需设置 `TRACKLOGIC_INPUT_KEYBOARD_TEST=1`。真实方向盘、热插拔和游戏内验收须单独进行。
 
 ## 命令行示例
 
@@ -373,6 +432,7 @@ go run ./examples/controller-demo -test-pedals
 .
 ├── pkg/
 │   ├── controller/                    # DirectInput 按钮/模拟轴公共 API + Windows 后端
+│   ├── input/                         # VR 统一绑定、RawGameController、键盘监听/拦截
 │   └── hpr/
 │       ├── doc.go                       # 包注释
 │       ├── types.go                     # 公开 API
@@ -384,6 +444,8 @@ go run ./examples/controller-demo -test-pedals
 │       └── windows.go                   # Win32 HID 后端
 └── examples/
     ├── controller-demo/                 # DirectInput 列表/绑定/监控
+    ├── input-demo/                      # VR 输入诊断和完整绑定录入
+    ├── input-tester/                    # VR 原生输入可视化测试窗口
     └── hpr-demo/                        # 踏板振动示例程序
 ```
 
