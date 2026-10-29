@@ -41,8 +41,9 @@ const (
 
 	gaRoot = 2
 
-	deviceBuffer   = 256
-	axisRawMaximum = 65535
+	deviceBuffer = 256
+	// Software output coordinates, independent of the device's ADC resolution.
+	axisRawMaximum = 4095
 )
 
 var (
@@ -1014,6 +1015,23 @@ func (d *iDirectInputDevice8W) setAxisRange(objectType uint32, minimum, maximum 
 	runtime.KeepAlive(property)
 	if hresultFailed(uint32(hr)) {
 		return newDirectInputError("IDirectInputDevice8.SetProperty(DIPROP_RANGE)", uint32(hr))
+	}
+	// Some drivers accept SetProperty without applying the range. Never divide
+	// their samples by our requested maximum unless the readback agrees.
+	property.minimum, property.maximum = 0, 0
+	hr, _, _ = syscall.SyscallN(
+		d.vtable.getProperty,
+		uintptr(unsafe.Pointer(d)),
+		dipropRange,
+		uintptr(unsafe.Pointer(&property)),
+	)
+	runtime.KeepAlive(d)
+	runtime.KeepAlive(property)
+	if hresultFailed(uint32(hr)) {
+		return newDirectInputError("IDirectInputDevice8.GetProperty(DIPROP_RANGE)", uint32(hr))
+	}
+	if property.minimum != minimum || property.maximum != maximum {
+		return fmt.Errorf("DirectInput axis %d range mismatch: requested %d..%d, reported %d..%d", objectType, minimum, maximum, property.minimum, property.maximum)
 	}
 	return nil
 }

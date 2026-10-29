@@ -99,7 +99,7 @@ func (b Binding) Matches(event ButtonEvent) bool {
 }
 
 // AxisEvent is a sample from an absolute DirectInput axis. Value is normalized
-// to 0..1; RawValue uses the configured DirectInput range 0..65535.
+// to 0..1; RawValue uses the configured DirectInput range 0..4095.
 type AxisEvent struct {
 	Device    DeviceInfo `json:"device"`
 	Axis      uint16     `json:"axis"`
